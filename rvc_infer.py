@@ -9,6 +9,7 @@ import numpy as np
 import yaml
 import pkg_resources
 import logging
+import time
 
 from multiprocessing import cpu_count
 from vc_infer_pipeline import VC
@@ -18,6 +19,8 @@ from lib.audio import load_audio
 from fairseq import checkpoint_utils
 from scipy.io import wavfile
 
+hubert_model = None
+current_voice_model_path = None
 
 class Config:
     def __init__(self,device,is_half):
@@ -164,6 +167,7 @@ def vc_single(
     times = [0, 0, 0]
     if not hubert_model:
         load_hubert()
+    
     if_f0 = cpt.get("f0", 1)
     file_index = (
         (
@@ -280,7 +284,7 @@ def rvc_convert(model_path,
         output_file_path (str) : file path and name of tshe output wav file
 
     '''
-    global config, now_dir, hubert_model, tgt_sr, net_g, vc, cpt, device, is_half, version
+    global config, now_dir, hubert_model, tgt_sr, net_g, vc, cpt, device, is_half, version, current_voice_model_path
     
     if torch.cuda.is_available():
         device = "cuda:0"
@@ -317,9 +321,12 @@ def rvc_convert(model_path,
     now_dir=os.getcwd()
     sys.path.append(now_dir)
 
-    hubert_model=None
+    #hubert_model=None
 
-    get_vc(model_path)
+    if current_voice_model_path != model_path:
+        current_voice_model_path = model_path
+        get_vc(model_path)
+
     wav_opt=vc_single(0,input_path,f0_up_key,None,f0method,file_index,file_index2,index_rate,filter_radius,resample_sr,rms_mix_rate,protect)
     wavfile.write(output_file_path, tgt_sr, wav_opt)
     print(f"\nFile finished writing to: {output_file_path}")
