@@ -10,6 +10,13 @@ import yaml
 import pkg_resources
 import logging
 import time
+import uvicorn
+from fastapi import FastAPI, Response
+from fastapi.responses import StreamingResponse, JSONResponse
+import io
+from pydantic import BaseModel
+import soundfile as sf
+from io import BytesIO
 
 from multiprocessing import cpu_count
 from vc_infer_pipeline import VC
@@ -21,6 +28,26 @@ from scipy.io import wavfile
 
 hubert_model = None
 current_voice_model_path = None
+
+# Define FastAPI application
+APP = FastAPI()
+
+class RVCRequest(BaseModel):
+    model_path: str
+    f0_up_key: int = 0
+    input_path: str 
+    output_dir_path: str = ""
+    is_half: str = "False"
+    f0method: str = "rmvpe"
+    file_index: str = ""
+    file_index2: str = ""
+    index_rate: float = 1.0
+    filter_radius: int = 3
+    resample_sr: int = 0
+    rms_mix_rate: float = 0.5
+    protect: float = 0.33
+    verbose: bool = False
+    return_is_binary: bool = False
 
 class Config:
     def __init__(self,device,is_half):
@@ -247,7 +274,14 @@ def load_config():
 
     return rvc_conf
 
-def rvc_convert(model_path,
+def pack_wav(io_buffer: BytesIO, data: np.ndarray, rate: int):
+    io_buffer = BytesIO()
+    sf.write(io_buffer, data, rate, format="wav")
+    io_buffer.seek(0)
+    return io_buffer
+
+
+def _rvc_convert_shared(model_path,
             f0_up_key=0,
             input_path=None, 
             output_dir_path=None,
@@ -261,9 +295,9 @@ def rvc_convert(model_path,
             rms_mix_rate=0.5,
             protect=0.33,
             verbose=False
-          ):  
+          ):
     '''
-    Function to call for the rvc voice conversion.  All parameters are the same present in that of the webui
+    Shared function for RVC voice conversion. All parameters are the same present in that of the webui
 
     Args: 
         model_path (str) : path to the rvc voice model you're using
@@ -281,8 +315,7 @@ def rvc_convert(model_path,
         protect (int) : protect voiceless consonants and breath sounds to prevent artifacts such as tearing in electronic music. Set to 0.5 to disable. Decrease the value to increase protection, but it may reduce indexing accuracy
 
     Returns:
-        output_file_path (str) : file path and name of tshe output wav file
-
+        tuple: (wav_opt, tgt_sr) containing the processed audio data and target sample rate
     '''
     global config, now_dir, hubert_model, tgt_sr, net_g, vc, cpt, device, is_half, version, current_voice_model_path
     
@@ -307,7 +340,6 @@ def rvc_convert(model_path,
     else:
         # Mainly for Jarod's Vivy project, specify entire path + wav name
         output_file_path = output_dir_path
-        pass
 
     create_directory(output_dir_path)
     output_dir = get_path(output_dir_path)
@@ -321,21 +353,105 @@ def rvc_convert(model_path,
     now_dir=os.getcwd()
     sys.path.append(now_dir)
 
-    #hubert_model=None
-
     if current_voice_model_path != model_path:
         current_voice_model_path = model_path
         get_vc(model_path)
 
-    wav_opt=vc_single(0,input_path,f0_up_key,None,f0method,file_index,file_index2,index_rate,filter_radius,resample_sr,rms_mix_rate,protect)
+    wav_opt = vc_single(0,input_path,f0_up_key,None,f0method,file_index,file_index2,index_rate,filter_radius,resample_sr,rms_mix_rate,protect)
+    
+    return wav_opt, tgt_sr, output_file_path
+
+def rvc_convert(model_path,
+            f0_up_key=0,
+            input_path=None, 
+            output_dir_path=None,
+            _is_half="False",
+            f0method="rmvpe",
+            file_index="",
+            file_index2="",
+            index_rate=1,
+            filter_radius=3,
+            resample_sr=0,
+            rms_mix_rate=0.5,
+            protect=0.33,
+            verbose=False):
+    """Convert audio and save to file"""
+    wav_opt, tgt_sr, output_file_path = _rvc_convert_shared(
+        model_path, f0_up_key, input_path, output_dir_path, _is_half,
+        f0method, file_index, file_index2, index_rate, filter_radius,
+        resample_sr, rms_mix_rate, protect, verbose
+    )
+    
     wavfile.write(output_file_path, tgt_sr, wav_opt)
     print(f"\nFile finished writing to: {output_file_path}")
-
     return output_file_path
 
+def rvc_convert_to_binary(model_path,
+            f0_up_key=0, 
+            input_path=None,
+            output_dir_path=None,
+            _is_half="False",
+            f0method="rmvpe",
+            file_index="",
+            file_index2="",
+            index_rate=1,
+            filter_radius=3,
+            resample_sr=0,
+            rms_mix_rate=0.5,
+            protect=0.33,
+            verbose=False):
+    """Convert audio and return binary data"""
+    wav_opt, tgt_sr, _ = _rvc_convert_shared(
+        model_path, f0_up_key, input_path, output_dir_path, _is_half,
+        f0method, file_index, file_index2, index_rate, filter_radius,
+        resample_sr, rms_mix_rate, protect, verbose
+    )
+    
+    audio_data = pack_wav(BytesIO(), wav_opt, tgt_sr).getvalue()
+    return Response(audio_data, media_type=f"audio/wav")
+
+@APP.post("/rvc_convert")
+async def api_rvc_convert(request: RVCRequest):
+    """
+    Endpoint for RVC voice conversion
+    
+    Returns a JSON response with the path to the generated audio file
+    """
+    try:
+        # Call the function with the request parameters
+        return rvc_convert_to_binary(
+            model_path=request.model_path,
+            f0_up_key=request.f0_up_key,
+            input_path=request.input_path,
+            output_dir_path=request.output_dir_path if request.output_dir_path else None, # Should be None if not specified
+            _is_half=request.is_half,
+            f0method=request.f0method,
+            file_index=request.file_index,
+            file_index2=request.file_index2,
+            index_rate=request.index_rate,
+            filter_radius=request.filter_radius,
+            resample_sr=request.resample_sr,
+            rms_mix_rate=request.rms_mix_rate,
+            protect=request.protect,
+            verbose=request.verbose,
+            return_is_binary=request.return_is_binary
+        )
+        
+        #return JSONResponse(status_code=200, content={"output_file": output_path})
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
 def main():
-    # Need to comment out yaml setting for input audio
-    rvc_convert(model_path="models\\ado.pth", input_path="delilah.wav")
+    parser = argparse.ArgumentParser(description="RVC inference API")
+    parser.add_argument("-a", "--bind_addr", type=str, default="127.0.0.1", help="default: 127.0.0.1")
+    parser.add_argument("-p", "--port", type=int, default=9890, help="default: 9890")
+    args = parser.parse_args()
+    
+    host = args.bind_addr
+    port = args.port
+    
+    # Run the API server
+    uvicorn.run(app=APP, host=host, port=port, workers=1)
 
 if __name__ == "__main__":
     main()

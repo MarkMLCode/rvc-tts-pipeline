@@ -11,3 +11,6 @@
 hubert_base.pt
 rmvpe.pt
 rvc.yaml
+dist/*
+rvc_tts_pipe.egg-info/*
+__pycache__
